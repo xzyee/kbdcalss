@@ -110,9 +110,9 @@ Return Value:
                     break;
                 }
 
-				//计算powerState.DeviceState到底是什么
-				//如果支持WW，并且数据合理的话，可以使用S[D]映射，否则统统D3
-				if (WAITWAKE_ON (data) &&
+		//计算powerState.DeviceState到底是什么
+		//如果支持WW，并且数据合理的话，可以使用S[D]映射，否则统统D3
+		if (WAITWAKE_ON (data) &&
                     powerState.SystemState < PowerSystemHibernate) {
                     ASSERT (powerState.SystemState >= PowerSystemWorking &&
                             powerState.SystemState < PowerSystemHibernate);
@@ -247,8 +247,8 @@ Return Value:
         IoCompleteRequest (Irp, IO_NO_INCREMENT);
 
     } else if (hookit) {
-		//无论S_IRP还是D_IRP的上电都到此
-		//按要求就应该设置完成函数，在完成函数中做事
+	//无论S_IRP还是D_IRP的上电都到此
+	//按要求就应该设置完成函数，在完成函数中做事
         status = IoAcquireRemoveLock (&data->RemoveLock, Irp);
         ASSERT (STATUS_SUCCESS == status);
         IoCopyCurrentIrpStackLocationToNext (Irp);
@@ -378,7 +378,7 @@ KeyboardClassPowerComplete (
             data->SystemState = powerState.SystemState;//保存context，这里是新的SystemState
             powerState.DeviceState = PowerDeviceD0;
 
-			//按照微软要求，在S_IRP的完成函数中应当开始SET设备功率的历程
+	    //按照微软要求，在S_IRP的完成函数中应当开始SET设备功率的历程
             status = PoRequestPowerIrp (data->Self,
                                         IRP_MN_SET_POWER,
                                         powerState, //PowerDeviceD0
@@ -436,7 +436,7 @@ KeyboardClassPoRequestComplete (
         PoSetPowerState (data->Self, SystemPowerState, powerState);//这时告知很合理
         data->SystemState = powerState.SystemState;//保存context，这里是新的SystemState
 
-		//往下传
+	//往下传
         PoStartNextPowerIrp (S_Irp);
         IoSkipCurrentIrpStackLocation (S_Irp);//本层未来没有要处理的
         PoCallDriver (data->TopPort, S_Irp);
