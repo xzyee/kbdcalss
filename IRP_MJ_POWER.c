@@ -30,7 +30,7 @@ Return Value:
     NTSTATUS        status;
     POWER_STATE     powerState;
     BOOLEAN         hookit = FALSE;
-    BOOLEAN         pendit = FALSE; //仅仅为"系统关电"而设计
+    BOOLEAN         pendit = FALSE;
 
     PAGED_CODE ();
 
@@ -81,7 +81,7 @@ Return Value:
             if (data->DeviceState < powerState.DeviceState) {
                 //
                 // Powering down
-                //
+                // 设备power down还真没什么事，仅仅保存一下down到什么功率
                 PoSetPowerState (data->Self, powerType, powerState);
                 data->DeviceState = powerState.DeviceState;
             }
@@ -95,21 +95,6 @@ Return Value:
 
         case SystemPowerState:
 
-		//分三种情况处理
-		// （1）关电，调用PoRequestPowerIrp发包，弄个将返回STATUS_PENDING的标志
-		//		在完成函数中：
-        //		PoStartNextPowerIrp (S_Irp);
-        //		IoSkipCurrentIrpStackLocation (S_Irp);//本层不再处理
-        //		PoCallDriver (data->TopPort, S_Irp);//往下传递
-		
-		// （2）上电，暂时不做事，后面再添加完成函数，发到下层，最终会返回STATUS_PENDING
-		//		在完成函数中又调用PoRequestPowerIrp发包要设备上电
-		//      最终确认调用：
-        //		PoStartNextPowerIrp (Irp);		
-		// （3）没变化，发一个Wait Wake IRP，最后会：
-		//		PoStartNextPowerIrp (Irp);
-        //		IoSkipCurrentIrpStackLocation (Irp);
-        //		status = PoCallDriver (data->TopPort, Irp);//真正代码在此
             if (data->SystemState < powerState.SystemState) {
                 //
                 // Powering down
@@ -125,9 +110,9 @@ Return Value:
                     break;
                 }
 
-				//设置powerState.DeviceState 到底是多少
-				
-                if (WAITWAKE_ON (data) && // ((port)->WaitWakeIrp != 0)
+				//计算powerState.DeviceState到底是什么
+				//如果支持WW，并且数据合理的话，可以使用S[D]映射，否则统统D3
+				if (WAITWAKE_ON (data) &&
                     powerState.SystemState < PowerSystemHibernate) {
                     ASSERT (powerState.SystemState >= PowerSystemWorking &&
                             powerState.SystemState < PowerSystemHibernate);
@@ -139,19 +124,13 @@ Return Value:
                     powerState.DeviceState = PowerDeviceD3;
                 }
 
-				//现在在派遣函数里面
-				//即没有使用IoCompleteRequest 完成IRP，
-				//也没有把IRP传递到下层，而是搞了个功率管理IRP把本IRP当参数发出去了，
-				//要在那个完成函数中完成本IRP，在那个完成函数中也没有完成，而是转发了
-				//所以就应该调用IoMarkIrpPending(Irp)
                 IoMarkIrpPending(Irp);
-				//allocates a power IRP and sends it to the top driver in the device stack for the specified device.
-                status  = PoRequestPowerIrp (data->Self, //PDEVICE_OBJECT
-                                             IRP_MN_SET_POWER, //MinorFunction
-                                             powerState, //POWER_STATE             
-                                             KeyboardClassPoRequestComplete,//PREQUEST_POWER_COMPLETE
-                                             Irp,//Context
-                                             NULL); //out，没有
+                status  = PoRequestPowerIrp (data->Self,
+                                             IRP_MN_SET_POWER,
+                                             powerState,
+                                             KeyboardClassPoRequestComplete,
+                                             Irp,
+                                             NULL);
 
                 if (!NT_SUCCESS(status)) {
                     //
@@ -179,7 +158,7 @@ Return Value:
                     return STATUS_PENDING;
                 }
                 else {
-                    pendit = TRUE; //仅仅为"系统关电"而设计
+                    pendit = TRUE; //S_IRP的power down需要pending，因为暂时终止了S_IRP的下传
                 }
             }
             else if (powerState.SystemState < data->SystemState) {
@@ -191,7 +170,7 @@ Return Value:
             }
             else {
                 //
-                // No change, but we want to make sure a wait wake irp is sent.
+                
                 //
                 if (powerState.SystemState == PowerSystemWorking &&
                     SHOULD_SEND_WAITWAKE (data)) {
@@ -229,14 +208,14 @@ Return Value:
                                               Irp,
                                               NULL) != NULL) {
             /*  When powering up with WW being completed at same time, there
-                is a race condition between PoReq completion for S Irp and
-                completion of WW irp. Steps to repro this:
+                is a race condition between PoReq completion for S_Irp and
+                completion of WW_irp. Steps to repro this:
 
-                S irp completes and does PoReq of D irp with completion
+                S_irp completes and does PoReq of D_irp with completion
                 routine MouseClassPoRequestComplete
                 WW Irp completion fires and the following happens:
-                    set data->WaitWakeIrp to NULL
-                    PoReq D irp with completion routine MouseClassWWPowerUpComplete
+                    1. set data->WaitWakeIrp to NULL
+                    2. PoReq D_irp with completion routine MouseClassWWPowerUpComplete
 
                 MouseClassPoRequestComplete fires first and sees no WW queued,
                 so it queues one.
@@ -262,27 +241,26 @@ Return Value:
         break;
     }
 
-	//怎么说好呢？因为什么就结束了？
-	//你不处理，也不让别人处理？
-	//这IRP包到底是发给谁的？没有谁主动承担？还是这么一咕噜往下溜，溜到哪算哪？
     if (!NT_SUCCESS (status)) {
         Irp->IoStatus.Status = status;
         PoStartNextPowerIrp (Irp);
         IoCompleteRequest (Irp, IO_NO_INCREMENT);
 
-    } else if (hookit) { //只处理"Power up"的情况
+    } else if (hookit) {
+		//无论S_IRP还是D_IRP的上电都到此
+		//按要求就应该设置完成函数，在完成函数中做事
         status = IoAcquireRemoveLock (&data->RemoveLock, Irp);
         ASSERT (STATUS_SUCCESS == status);
         IoCopyCurrentIrpStackLocationToNext (Irp);
 
         IoSetCompletionRoutine (Irp,
-                                KeyboardClassPowerComplete,//通知Power+创建另一个IRP点亮键盘灯
+                                KeyboardClassPowerComplete,//一函数两用途
                                 NULL,
                                 TRUE,
                                 TRUE,
                                 TRUE);
-        IoMarkIrpPending(Irp); //IO Manager，我要返回STATUS_PENDING了
-        PoCallDriver (data->TopPort, Irp);
+        IoMarkIrpPending(Irp);
+        PoCallDriver (data->TopPort, Irp);//必须下行到Bus驱动，不理会PoCallDriver的返回
 
         //
         // We are returning pending instead of the result from PoCallDriver because:
@@ -291,31 +269,152 @@ Return Value:
         //
         status = STATUS_PENDING;
     }
-    else if (pendit) {//仅仅为"系统关电"而设计,目的是暂时不往下传，IRP被当成参数传出去了
-		
-        status = STATUS_PENDING;//针对"系统关电"，因为已经通过PoRequestPowerIrp另起炉灶，把IRP通过参数传出去了
-								//在PoRequestPowerIrp的自己的完成函数的最后会继续往下传，就像没有完成函数一样
+    else if (pendit) {
+        status = STATUS_PENDING; //S_IRP的power down需要pending，因为暂时终止了S_IRP的下传
     } else {
-		
         PoStartNextPowerIrp (Irp);
         IoSkipCurrentIrpStackLocation (Irp);
         status = PoCallDriver (data->TopPort, Irp);
+    }
 
     IoReleaseRemoveLock (&data->RemoveLock, Irp);
     return status;
 }
+NTSTATUS
+KeyboardClassPowerComplete (
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp,
+    IN PVOID Context
+    )
+{
+    NTSTATUS            status;
+    POWER_STATE         powerState;
+    POWER_STATE_TYPE    powerType;
+    PIO_STACK_LOCATION  stack, next;
+    PIRP                irpLeds;
+    PDEVICE_EXTENSION   data;
+    IO_STATUS_BLOCK     block;
+    PFILE_OBJECT        file;
+    PKEYBOARD_INDICATOR_PARAMETERS params;
 
-//"系统"功率的完成函数，在某个底层bus驱动完成后执行
-//"上电"要整一个wait wake irp，我胡汉三回来了，都给我醒醒
-//"关电"要保存关到什么程度，关电关呗，记录下
-//注意该完成函数没有返回值，这个与其他完成函数不一样，就是干点事呗
+    UNREFERENCED_PARAMETER (Context);
+
+    data = (PDEVICE_EXTENSION) DeviceObject->DeviceExtension;
+    stack = IoGetCurrentIrpStackLocation (Irp);
+    next = IoGetNextIrpStackLocation (Irp);
+    powerType = stack->Parameters.Power.Type;  //取回信息
+    powerState = stack->Parameters.Power.State;//取回信息
+
+    ASSERT (data != Globals.GrandMaster);
+    ASSERT (data->PnP);
+
+    switch (stack->MinorFunction) {
+    case IRP_MN_SET_POWER:
+        switch (powerType) {
+        case DevicePowerState:
+            ASSERT (powerState.DeviceState < data->DeviceState);
+            //
+            // Powering up
+            //
+            PoSetPowerState (data->Self, powerType, powerState);//此时告知合理
+            data->DeviceState = powerState.DeviceState;//保存context，这里是新的DeviceState
+
+            irpLeds = IoAllocateIrp(DeviceObject->StackSize, FALSE);
+            if (irpLeds) {
+                status = IoAcquireRemoveLock(&data->RemoveLock, irpLeds);
+
+                if (NT_SUCCESS(status)) {
+                    //
+                    // Set the keyboard Indicators.
+                    //
+                    if (Globals.GrandMaster) {
+                        params = &Globals.GrandMaster->IndicatorParameters;
+                        file = Globals.AssocClassList[data->UnitId].File;
+                    } else {
+                        params = &data->IndicatorParameters;
+                        file = stack->FileObject;
+                    }
+
+                    //
+                    // This is a completion routine.  We could be at DISPATCH_LEVEL
+                    // Therefore we must bounce the IRP
+                    //
+                    next = IoGetNextIrpStackLocation(irpLeds);
+
+                    next->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
+                    next->Parameters.DeviceIoControl.IoControlCode =
+                        IOCTL_KEYBOARD_SET_INDICATORS;
+                    next->Parameters.DeviceIoControl.InputBufferLength =
+                        sizeof (KEYBOARD_INDICATOR_PARAMETERS);
+                    next->Parameters.DeviceIoControl.OutputBufferLength = 0;
+                    next->FileObject = file;
+
+                    IoSetCompletionRoutine (irpLeds,
+                                            KeyboardClassSetLedsComplete,
+                                            data,
+                                            TRUE,
+                                            TRUE,
+                                            TRUE);
+
+                    irpLeds->AssociatedIrp.SystemBuffer = params;
+
+                    IoCallDriver (data->TopPort, irpLeds);
+                }
+                else {
+                    IoFreeIrp (irpLeds); //拿锁失败
+                }
+            }
+
+            break;
+
+        case SystemPowerState:
+            ASSERT (powerState.SystemState < data->SystemState);
+            //
+            // Powering up
+            //
+            // Save the system state before we overwrite it
+            //
+            PoSetPowerState (data->Self, powerType, powerState);//此时告知合理
+            data->SystemState = powerState.SystemState;//保存context，这里是新的SystemState
+            powerState.DeviceState = PowerDeviceD0;
+
+			//按照微软要求，在S_IRP的完成函数中应当开始SET设备功率的历程
+            status = PoRequestPowerIrp (data->Self,
+                                        IRP_MN_SET_POWER,
+                                        powerState, //PowerDeviceD0
+                                        KeyboardClassPoRequestComplete,//一函数两用途
+                                        NULL, //以示区别
+                                        NULL);
+
+            //
+            // Propagate the error if one occurred
+            //
+            if (!NT_SUCCESS(status)) {
+                Irp->IoStatus.Status = status;
+            }
+
+            break;
+        }
+        break;
+
+    default:
+        ASSERT (0xBADBAD == stack->MinorFunction);
+        break;
+    }
+
+    PoStartNextPowerIrp (Irp);
+    IoReleaseRemoveLock (&data->RemoveLock, Irp);
+
+    return STATUS_SUCCESS;
+}
+
 VOID
 KeyboardClassPoRequestComplete (
     IN PDEVICE_OBJECT DeviceObject,
-    IN UCHAR MinorFunction, //未用
-    IN POWER_STATE D_PowerState,//未用
+    IN UCHAR MinorFunction,
+    IN POWER_STATE D_PowerState,
     IN PIRP S_Irp, // The S irp that caused us to request the power.
-    IN PIO_STATUS_BLOCK IoStatus //未用
+    IN PIO_STATUS_BLOCK IoStatus
     )
 {
     PDEVICE_EXTENSION   data;
@@ -332,24 +431,15 @@ KeyboardClassPoRequestComplete (
 
         //
         // Powering Down
-        //
-		//关电到什么程度？
+        // 到这里，设备SET POWER的完成函数都执行完毕了，设备马上要进入低功耗状态
         powerState = IoGetCurrentIrpStackLocation(S_Irp)->Parameters.Power.State;
-		//A driver calls this routine after receiving a device set-power request and before 
-		//calling PoStartNextPowerIrp.
-		//If the device is powering down, the driver must call PoSetPowerState before leaving the D0 state
-		//给Power Manager发个通知说"系统"已经处于一个新功率状态了		
-        PoSetPowerState (data->Self, SystemPowerState, powerState);
-        data->SystemState = powerState.SystemState;//保存起来
+        PoSetPowerState (data->Self, SystemPowerState, powerState);//这时告知很合理
+        data->SystemState = powerState.SystemState;//保存context，这里是新的SystemState
 
-		//S_Irp就是原来请求电源管理的IRP，其传递的路径很有研究的必要：
-		//在派遣函数中，没有继续往下传，派遣函数返回STATUS_PENDING
-		//没往下传不对啊？原来他调用了另一个功率管理函数PoRequestPowerIrp另起炉灶，把IRP传递到此
-		//本函数是PoRequestPowerIrp的完成函数，这里IRP按下面三行继续传下去
-		
-        PoStartNextPowerIrp (S_Irp);//处理其他功率管理IRP
-        IoSkipCurrentIrpStackLocation (S_Irp);//本层不再处理
-        PoCallDriver (data->TopPort, S_Irp);//往下传递
+		//往下传
+        PoStartNextPowerIrp (S_Irp);
+        IoSkipCurrentIrpStackLocation (S_Irp);//本层未来没有要处理的
+        PoCallDriver (data->TopPort, S_Irp);
 
         //
         // Finally, release the lock we acquired based on this irp
@@ -369,8 +459,7 @@ KeyboardClassPoRequestComplete (
         //
         ASSERT(data->SystemState == PowerSystemWorking);
 
-		//发送一个wait wake irp包
-        if (SHOULD_SEND_WAITWAKE (data)) {
+        if (SHOULD_SEND_WAITWAKE (data)) { //如果不发WW的话，就什么事都不需要做
             //
             // We cannot call CreateWaitWake from this completion routine,
             // as it is a paged function.
@@ -389,11 +478,10 @@ KeyboardClassPoRequestComplete (
 
                 itemData->Data = data;
                 itemData->Irp = NULL;
-                status = IoAcquireRemoveLock (&data->RemoveLock, itemData);//马上要拿锁
+                status = IoAcquireRemoveLock (&data->RemoveLock, itemData);
 
                 if (NT_SUCCESS(status)) {
-					//搞个工作线程，工作任务是创建一个wait wake irp
-                    IoQueueWorkItem (itemData->Item, //IoAllocateWorkItem的返回
+                    IoQueueWorkItem (itemData->Item,
                                      KeyboardClassCreateWaitWakeIrpWorker,
                                      DelayedWorkQueue,
                                      itemData);
@@ -423,214 +511,21 @@ CreateWaitWakeWorkerError:
         }
     }
 }
-/*
-问题：注意到POWER_STATE结构是个union了吗？
-答案：
-typedef union _POWER_STATE {
-  SYSTEM_POWER_STATE SystemState;
-  DEVICE_POWER_STATE DeviceState;
-} POWER_STATE, *PPOWER_STATE;
-*/
 
-//这个函数总返回STATUS_SUCCESS
-//这个函数的目的是当"设备恢复上电"后，恢复性点亮指示灯
-//都要调用PoSetPowerState给Power Manager发个通知说"系统"已经处于一个新功率状态了		
+//
+// On some busses, we can power down the bus, but not the system, in this case
+// we still need to allow the device to wake said bus, therefore
+// waitwake-supported should not rely on systemstate.
+//
+// #define WAITWAKE_SUPPORTED(port) ((port)->MinDeviceWakeState > PowerDeviceUnspecified) && \
+//                                  (port)->MinSystemWakeState > PowerSystemWorking)
+#define WAITWAKE_SUPPORTED(port) ((port)->MinDeviceWakeState > PowerDeviceD0 && \
+                                  (port)->MinSystemWakeState > PowerSystemWorking)
 
-NTSTATUS
-KeyboardClassPowerComplete ( //没有处理Power Down的内容
-    IN PDEVICE_OBJECT DeviceObject,
-    IN PIRP Irp,
-    IN PVOID Context //未用，传来的参数为NULL
-    )
-{
-    NTSTATUS            status;
-    POWER_STATE         powerState;
-    POWER_STATE_TYPE    powerType;
-    PIO_STACK_LOCATION  stack, next;
-    PIRP                irpLeds;
-    PDEVICE_EXTENSION   data;
-    IO_STATUS_BLOCK     block;
-    PFILE_OBJECT        file;
-    PKEYBOARD_INDICATOR_PARAMETERS params;
+// #define WAITWAKE_ON(port)        ((port)->WaitWakeIrp != 0)
+#define WAITWAKE_ON(port) \
+       (InterlockedCompareExchangePointer(&(port)->WaitWakeIrp, NULL, NULL) != NULL)
 
-    UNREFERENCED_PARAMETER (Context);
-
-    data = (PDEVICE_EXTENSION) DeviceObject->DeviceExtension;
-    stack = IoGetCurrentIrpStackLocation (Irp);
-    next = IoGetNextIrpStackLocation (Irp);
-	
-	//学习如何从IO_STACK_LOCATION取出数据
-    powerType = stack->Parameters.Power.Type;
-    powerState = stack->Parameters.Power.State;
-
-	//永远不会给大师发送功率管理IRP
-	//永远不会给非PNP设备发送功率管理IRP
-	//所以这里验证一下
-    ASSERT (data != Globals.GrandMaster);
-    ASSERT (data->PnP);
-
-    switch (stack->MinorFunction) {
-    case IRP_MN_SET_POWER:
-        switch (powerType) {
-        case DevicePowerState:
-			//保证这是增大功率（数字越小，功率越大）
-            ASSERT (powerState.DeviceState < data->DeviceState);
-            //
-            // Powering up
-            //
-			//给Power Manager发个通知说"设备"已经处于一个新功率状态了
-            PoSetPowerState (data->Self, DevicePowerState, powerState);
-			//保存起来
-            data->DeviceState = powerState.DeviceState;
-			
-			//下面恢复键盘灯，但是因为这是完成函数，运行的级别可能有点高。
-			//这里弹出一个控制IRP来解决这个问题，不过非要在这里解决问题的话
-			//应当怎么做？
-			
-			//驱动程序自己创建IRP的例子，不过应当自己释放内存，并且在完成函数中返回
-			//STATUS_MORE_PROCESSING_REQUIRED，告诉IO Manager不要释放内存
-            irpLeds = IoAllocateIrp(DeviceObject->StackSize, FALSE);
-            if (irpLeds) {
-                status = IoAcquireRemoveLock(&data->RemoveLock, irpLeds);
-
-                if (NT_SUCCESS(status)) {
-                    //
-                    // Set the keyboard Indicators.
-                    //
-                    if (Globals.GrandMaster) {
-                        params = &Globals.GrandMaster->IndicatorParameters;
-                        file = Globals.AssocClassList[data->UnitId].File;
-                    } else {
-                        params = &data->IndicatorParameters;
-                        file = stack->FileObject; //本层fileobject取出来何用？放下一层去
-                    }
-
-                    //
-                    // This is a completion routine.  We could be at DISPATCH_LEVEL
-                    // Therefore we must bounce the IRP
-                    //
-                    next = IoGetNextIrpStackLocation(irpLeds);
-
-                    next->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
-                    next->Parameters.DeviceIoControl.IoControlCode =
-                        IOCTL_KEYBOARD_SET_INDICATORS;
-                    next->Parameters.DeviceIoControl.InputBufferLength =
-                        sizeof (KEYBOARD_INDICATOR_PARAMETERS);
-                    next->Parameters.DeviceIoControl.OutputBufferLength = 0;
-                    next->FileObject = file;
-
-					//完成函数中又设了一个完成函数！
-					//不过不是针对进来的IRP，而是在本函数中创建的IRP
-					//所以也没有什么了不起
-                    IoSetCompletionRoutine (irpLeds,
-                                            KeyboardClassSetLedsComplete,//释放内存而已
-                                            data,
-                                            TRUE,
-                                            TRUE,
-                                            TRUE);
-					//要养成先设完成函数，再设输入地址buffer的习惯
-					//这其实也不一定要怎么做，非要这么做只是一种习惯
-                    irpLeds->AssociatedIrp.SystemBuffer = params;
-
-					//把新创建的点指示灯IRP控制包发出去
-                    IoCallDriver (data->TopPort, irpLeds);
-                }
-                else {
-                    IoFreeIrp (irpLeds); //正常释放
-                }
-            }
-
-            break;
-
-        case SystemPowerState:
-            ASSERT (powerState.SystemState < data->SystemState);
-            //
-            // Powering up
-            //
-            // Save the system state before we overwrite it
-            //
-			
-			//给Power Manager发个通知说"系统"已经处于一个新功率状态了		
-            PoSetPowerState (data->Self, SystemPowerState, powerState);
-			
-			//保存起来
-            data->SystemState = powerState.SystemState;
-			
-			//系统功率上来了，有必要改一下设备功率状态为D0级
-            powerState.DeviceState = PowerDeviceD0;
-
-			
-			//与设备上电后自己分配IRP包不同，这里采用了一个更加方面的函数创建并发送包
-			//因为功率请求IRP包的创建，设定完成函数，发送都写在一个函数中啦
-			//这个函数还有一个好处，在IRP_MN_SET_POWER情况下，连IRP的生死都不用管，就当没发生过
-            status = PoRequestPowerIrp (data->Self,
-                                        IRP_MN_SET_POWER,
-                                        powerState, //要设的功率
-                                        KeyboardClassPoRequestComplete,
-                                        NULL, //完成函数的参数，这次没参数
-                                        NULL); //创建的IRP地址，IRP_MN_SET_POWER时必须为0
-										       //就是函数返回前可能就被Free了，
-											   //不需要用户再次释放了
-
-            //
-            // Propagate the error if one occurred
-            //
-            if (!NT_SUCCESS(status)) { //这里可能不对，上面函数会返回STATUS_PENDING代替STATUS_SUCCESS
-                Irp->IoStatus.Status = status;
-            }
-
-            break;
-        }
-        break;
-
-    default:
-        ASSERT (0xBADBAD == stack->MinorFunction);
-        break;
-    }
-
-	//每个IRP_MN_SET_POWER处理完后，必须来这么一句
-	//新windows已经不用了
-	//通知Power Manager继续处理下一个功率管理IRP
-	//Msdn建议：As a general rule, a driver should call PoStartNextPowerIrp from its IoCompletion routine
-	//现在Irp包的生命还未结束
-    PoStartNextPowerIrp (Irp);
-	
-    IoReleaseRemoveLock (&data->RemoveLock, Irp);
-
-    return STATUS_SUCCESS;//这个完成函数无论如何都返回成功，IRP将被IO Manager释放
-}
-
-NTSTATUS
-KeyboardClassSetLedsComplete (
-    IN PDEVICE_OBJECT DeviceObject,
-    IN PIRP Irp,
-    IN PVOID Context
-    )
-{
-    PDEVICE_EXTENSION   data;
-
-    UNREFERENCED_PARAMETER (DeviceObject);
-
-    data = (PDEVICE_EXTENSION) Context;
-
-    IoReleaseRemoveLock (&data->RemoveLock, Irp);
-    IoFreeIrp (Irp);
-
-    return STATUS_MORE_PROCESSING_REQUIRED;
-}
-
-//SHOULD_SEND_WAITWAKE宏
-BOOLEAN
-KeyboardClassCheckWaitWakeEnabled(
-    IN PDEVICE_EXTENSION Data
-    )
-{
-    KIRQL irql;
-    BOOLEAN enabled;
-
-    KeAcquireSpinLock (&Data->WaitWakeSpinLock, &irql);
-    enabled = Data->WaitWakeEnabled;
-    KeReleaseSpinLock (&Data->WaitWakeSpinLock, irql);
-
-    return enabled;
-}
+#define SHOULD_SEND_WAITWAKE(port) (WAITWAKE_SUPPORTED(port) && \
+                                    !WAITWAKE_ON(port)       && \
+                                    KeyboardClassCheckWaitWakeEnabled(port))
